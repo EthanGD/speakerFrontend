@@ -12,7 +12,16 @@ export class AudioCapture {
 
   async start() {
     this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    this.mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: this.targetSampleRate,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      },
+      video: false
+    });
     this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
     this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
     this.processor.onaudioprocess = (event) => this.handleAudioProcess(event);

@@ -17,9 +17,9 @@
       <select id="langMode">
         <option value="mixed3" selected>仅按粤语/普通话/英语识别</option>
         <option value="mixed">自动混说</option>
-        <option value="yue">粤语优先</option>
-        <option value="zh">普通话优先</option>
-        <option value="en">英语优先</option>
+        <option value="yue">仅粤语</option>
+        <option value="zh">仅普通话</option>
+        <option value="en">仅英语</option>
       </select>
       <button id="btnStart">开始</button>
       <button id="btnStop" disabled>停止</button>
@@ -68,9 +68,13 @@
       let capture = null;
       let silenceMs = 0;
       const silenceThreshold = 0.008;
-      const silenceCommitMs = 900;
+      const silenceCommitMs = 1800;
+      const minSpeechCommitMs = 1200;
+      const finalCooldownMs = 1500;
       let frameCount = 0;
       let lastFrameLogTs = 0;
+      let speechMs = 0;
+      let lastFinalTs = 0;
 
       function logLine(text) {
         logBox.textContent += `${text}\n`;
@@ -179,6 +183,9 @@
         partialBox.textContent = "";
         logBox.textContent = "";
         traceBox.textContent = "";
+        silenceMs = 0;
+        speechMs = 0;
+        lastFinalTs = 0;
         frameCount = 0;
         lastFrameLogTs = 0;
         // #region debug-point C:start-meeting
@@ -211,18 +218,32 @@
               debugReport("C", "volume observed before frame send", { rms });
             }
             // #endregion
-            silenceMs = rms < silenceThreshold ? silenceMs + 100 : 0;
-            if (silenceMs >= silenceCommitMs && client?.isOpen) {
+            if (rms >= silenceThreshold) {
+              speechMs += 100;
+              silenceMs = 0;
+              return;
+            }
+            silenceMs += 100;
+            const now = Date.now();
+            if (
+              silenceMs >= silenceCommitMs &&
+              speechMs >= minSpeechCommitMs &&
+              client?.isOpen &&
+              now - lastFinalTs >= finalCooldownMs
+            ) {
               const payload = { is_speaking: false };
               trace(">>", payload);
               // #region debug-point D:final-json
               debugReport("D", "sending final json", {
                 frameCount,
-                silenceMs
+                silenceMs,
+                speechMs
               });
               // #endregion
               client.sendJson(payload);
               silenceMs = 0;
+              speechMs = 0;
+              lastFinalTs = now;
             }
           }
         });
@@ -248,6 +269,8 @@
           trace(">>", payload);
           client.sendJson(payload);
         }
+        silenceMs = 0;
+        speechMs = 0;
         if (capture) await capture.stop();
         if (client) client.close();
         btnStart.disabled = false;
