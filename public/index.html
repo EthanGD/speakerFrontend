@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>多人会议实时记录</title>
+    <link rel="stylesheet" href="../src/styles/style.css" />
+  </head>
+  <body>
+    <h1>多人会议实时音频转写</h1>
+    <p class="muted">FunASR + SenseVoiceSmall + FSMN-VAD + CAM++ + Paraformer-Streaming WebSocket</p>
+
+    <div class="row">
+      <label for="wsUrl">WebSocket</label>
+      <input id="wsUrl" value="ws://127.0.0.1:10095/ws" />
+      <label for="langMode">语言</label>
+      <select id="langMode">
+        <option value="mixed3" selected>仅按粤语/普通话/英语识别</option>
+        <option value="mixed">自动混说</option>
+        <option value="yue">粤语优先</option>
+        <option value="zh">普通话优先</option>
+        <option value="en">英语优先</option>
+      </select>
+      <button id="btnStart">开始</button>
+      <button id="btnStop" disabled>停止</button>
+      <button id="btnCopy">复制全文</button>
+    </div>
+
+    <div class="grid">
+      <div>
+        <div class="card" style="margin-bottom:16px;">
+          <div class="title">最终会议记录</div>
+          <div class="box" id="strictBox"></div>
+        </div>
+        <div class="card">
+          <div class="title">临时字幕</div>
+          <div class="box" id="partialBox"></div>
+        </div>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:16px;">
+          <div class="title">运行日志</div>
+          <div class="box dark" id="logBox"></div>
+        </div>
+        <div class="card">
+          <div class="title">WS JSON 历史</div>
+          <div class="box dark" id="traceBox"></div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module">
+      import { AudioCapture } from "../src/js/audio_capture.js";
+      import { MeetingWsClient } from "../src/js/websocket_client.js";
+
+      const strictBox = document.getElementById("strictBox");
+      const partialBox = document.getElementById("partialBox");
+      const logBox = document.getElementById("logBox");
+      const traceBox = document.getElementById("traceBox");
+      const wsUrlEl = document.getElementById("wsUrl");
+      const langModeEl = document.getElementById("langMode");
+      const btnStart = document.getElementById("btnStart");
+      const btnStop = document.getElementById("btnStop");
+      const btnCopy = document.getElementById("btnCopy");
+
+      let strictText = "";
+      let client = null;
+      let capture = null;
+      let silenceMs = 0;
+      const silenceThreshold = 0.008;
+      const silenceCommitMs = 900;
+      let frameCount = 0;
+      let lastFrameLogTs = 0;
+
+      function logLine(text) {
+        logBox.textContent += `${text}\n`;
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+
+      function trace(direction, payload) {
+        traceBox.textContent += `${new Date().toISOString()} ${direction} ${JSON.stringify(payload)}\n`;
+        traceBox.scrollTop = traceBox.scrollHeight;
+      }
+
+      function appendStrictBlock(lines) {
+        const block = lines.filter(Boolean).join("\n");
+        if (!block) return;
+        strictText = strictText ? `${strictText}${block}\n` : `${block}\n`;
+        strictBox.textContent = strictText;
+      }
+
+      // #region debug-point A:frontend-runtime-report
+      function debugReport(hypothesisId, msg, data = {}) {
+        logLine(`[DEBUG:${hypothesisId}] ${msg} ${JSON.stringify(data)}`);
+      }
+      // #endregion
+
+      function connect() {
+        // #region debug-point A:connect-entry
+        debugReport("A", "connect called", {
+          pageProtocol: window.location.protocol,
+          wsUrl: wsUrlEl.value.trim(),
+          userAgent: navigator.userAgent
+        });
+        // #endregion
+        client = new MeetingWsClient({
+          url: wsUrlEl.value.trim(),
+          onOpen: () => {
+            logLine("WebSocket 已连接");
+            // #region debug-point A:ws-open
+            debugReport("A", "websocket open", {
+              wsUrl: wsUrlEl.value.trim()
+            });
+            // #endregion
+            const init = {
+              mode: "online",
+              audio_fs: 16000,
+              chunk_size: [5, 10, 5],
+              chunk_interval: 10,
+              lang_mode: langModeEl.value
+            };
+            trace(">>", init);
+            // #region debug-point D:init-json
+            debugReport("D", "sending init json", init);
+            // #endregion
+            client.sendJson(init);
+          },
+          onMessage: (payload) => {
+            // #region debug-point D:ws-message
+            debugReport("D", "websocket message", {
+              hasText: typeof payload.text === "string",
+              isFinal: !!payload.is_final,
+              hasSegments: Array.isArray(payload.segments) ? payload.segments.length : 0,
+              keys: Object.keys(payload || {})
+            });
+            // #endregion
+            trace("<<", payload);
+            if (payload.error) logLine(`error: ${payload.error}`);
+            if (payload.diarization_warning) logLine(`diarization_warning: ${payload.diarization_warning}`);
+            if (Array.isArray(payload.segments) && payload.segments.length) {
+              appendStrictBlock(payload.segments.map((seg) => `[${seg.speaker_id || "unknown"}] ${seg.text || ""}`));
+            } else if (payload.is_final && payload.text) {
+              appendStrictBlock([payload.text]);
+            }
+            if (typeof payload.text === "string" && !payload.is_final) {
+              partialBox.textContent = payload.text;
+            }
+            if (payload.is_final) {
+              partialBox.textContent = "";
+              silenceMs = 0;
+            }
+          },
+          onClose: (event) => {
+            // #region debug-point A:ws-close
+            debugReport("A", "websocket close", {
+              code: event?.code,
+              reason: event?.reason,
+              wasClean: event?.wasClean
+            });
+            // #endregion
+            logLine("WebSocket 已关闭");
+          },
+          onError: (event) => {
+            // #region debug-point A:ws-error
+            debugReport("A", "websocket error", {
+              eventType: event?.type || "error",
+              wsUrl: wsUrlEl.value.trim()
+            });
+            // #endregion
+            logLine("WebSocket 连接异常");
+          }
+        });
+        client.connect();
+      }
+
+      async function startMeeting() {
+        strictText = "";
+        strictBox.textContent = "";
+        partialBox.textContent = "";
+        logBox.textContent = "";
+        traceBox.textContent = "";
+        frameCount = 0;
+        lastFrameLogTs = 0;
+        // #region debug-point C:start-meeting
+        debugReport("C", "startMeeting begin", {
+          wsUrl: wsUrlEl.value.trim(),
+          langMode: langModeEl.value
+        });
+        // #endregion
+        connect();
+        capture = new AudioCapture({
+          onPcmFrame: (frame) => {
+            if (client?.isOpen) {
+              frameCount += 1;
+              const now = Date.now();
+              // #region debug-point C:pcm-frame
+              if (frameCount <= 3 || now - lastFrameLogTs > 3000) {
+                lastFrameLogTs = now;
+                debugReport("C", "pcm frame sent", {
+                  frameCount,
+                  byteLength: frame.byteLength || frame.length || 0
+                });
+              }
+              // #endregion
+              client.sendBytes(frame);
+            }
+          },
+          onVolume: (rms) => {
+            // #region debug-point C:volume-check
+            if (frameCount === 0 && rms > 0.001) {
+              debugReport("C", "volume observed before frame send", { rms });
+            }
+            // #endregion
+            silenceMs = rms < silenceThreshold ? silenceMs + 100 : 0;
+            if (silenceMs >= silenceCommitMs && client?.isOpen) {
+              const payload = { is_speaking: false };
+              trace(">>", payload);
+              // #region debug-point D:final-json
+              debugReport("D", "sending final json", {
+                frameCount,
+                silenceMs
+              });
+              // #endregion
+              client.sendJson(payload);
+              silenceMs = 0;
+            }
+          }
+        });
+        await capture.start();
+        // #region debug-point C:audio-ready
+        debugReport("C", "audio capture started", {
+          sampleRate: capture.audioContext?.sampleRate || 0
+        });
+        // #endregion
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+      }
+
+      async function stopMeeting() {
+        // #region debug-point D:stop-meeting
+        debugReport("D", "stopMeeting called", {
+          frameCount,
+          clientOpen: !!client?.isOpen
+        });
+        // #endregion
+        if (client?.isOpen) {
+          const payload = { is_speaking: false };
+          trace(">>", payload);
+          client.sendJson(payload);
+        }
+        if (capture) await capture.stop();
+        if (client) client.close();
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+      }
+
+      btnStart.addEventListener("click", () => startMeeting().catch((err) => logLine(String(err))));
+      btnStop.addEventListener("click", () => stopMeeting().catch((err) => logLine(String(err))));
+      btnCopy.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(strictText);
+        logLine("最终会议记录已复制");
+      });
+    </script>
+  </body>
+</html>
